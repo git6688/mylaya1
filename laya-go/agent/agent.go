@@ -64,13 +64,13 @@ type Agent struct {
 	closed   atomic.Bool    // mirrors shut, for the check between chunks
 	once     sync.Once      // runs Close's body
 	closeErr error          // the session's Close error, read after once.Do
+
+	hk *hookState // hooks; see hooks.go
 }
 
-// Option adjusts an Agent at Open. No options exist yet; the parameter is here so adding one is
-// not a breaking change.
+// Option adjusts an Agent at Open: WithInstalledHooks, WithHookTimeout, WithHookErrors,
+// WithConcurrentHooks, WithHookWarnings, WithLangTemperatures and WithExpectedSHA256.
 type Option func(*options)
-
-type options struct{}
 
 // Open loads rl_agent_config.json and the tokenizer from checkpoint, a directory holding a
 // laya checkpoint, and takes ownership of s: on error it closes s, and otherwise Close does.
@@ -80,24 +80,34 @@ func Open(checkpoint fs.FS, s infer.Session, opts ...Option) (*Agent, error) {
 	if hasNilValue(s) {
 		return nil, errors.New("agent: Open needs a session")
 	}
-	var o options
+	o := options{raise: true}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&o)
 		}
 	}
-	a, err := open(checkpoint, s)
+	if o.err != nil {
+		return nil, errors.Join(o.err, s.Close())
+	}
+	a, err := open(checkpoint, s, o)
 	if err != nil {
 		return nil, errors.Join(err, s.Close())
 	}
 	return a, nil
 }
 
-func open(checkpoint fs.FS, s infer.Session) (*Agent, error) {
+func open(checkpoint fs.FS, s infer.Session, o options) (*Agent, error) {
 	if checkpoint == nil {
 		return nil, errors.New("agent: Open needs a checkpoint")
 	}
-	cfg, temps, err := loadConfig(checkpoint)
+	want, err := expectedDigests(o.sha256)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyDigests(checkpoint, want); err != nil {
+		return nil, err
+	}
+	cfg, temps, err := loadConfig(checkpoint, o.langTemps)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +128,7 @@ func open(checkpoint fs.FS, s infer.Session) (*Agent, error) {
 			pad = id
 		}
 	}
-	return &Agent{tok: tok, padID: pad, cfg: cfg, temps: temps, sess: s}, nil
+	return &Agent{tok: tok, padID: pad, cfg: cfg, temps: temps, sess: s, hk: newHookState(o)}, nil
 }
 
 // Config returns a copy of the checkpoint configuration the agent runs with.
@@ -129,10 +139,13 @@ func (a *Agent) Config() Config {
 }
 
 // Close marks the agent closed, waits for calls in flight and closes the session. Close blocks
-// until calls in flight return; cancel their contexts to bound it. A call that has not yet
-// entered returns ErrClosed without waiting. Close is idempotent: a second call, concurrent or
-// not, waits for the first and returns the same error. Close must not be called from inside a
-// call (from the session's Run): it would wait for that call, which waits for Close.
+// until calls in flight return. Cancelling a call's context ends it between chunks and releases a
+// call still queued for the serial hook lock, but a hook that has started is always waited for:
+// only WithHookTimeout bounds that wait. A call that has not yet entered returns ErrClosed without
+// waiting. Close is idempotent: a second call, concurrent or not, waits for the first and returns
+// the same error. Close must not be called from inside a call, from the session's Run or from a
+// hook: it would wait for that call, which waits for Close (with a hook timeout set, a hook's
+// Close returns only after the timeout releases its call).
 func (a *Agent) Close() error {
 	a.once.Do(func() {
 		defer func() {
@@ -145,6 +158,7 @@ func (a *Agent) Close() error {
 		a.shut = true
 		a.closed.Store(true)
 		a.mu.Unlock()
+		a.hk.quit() // releases calls queued for the serial lock before OnPredictStart
 		a.inflight.Wait()
 		if a.sess != nil {
 			a.closeErr = a.sess.Close()
@@ -176,6 +190,20 @@ type call struct {
 	sort   bool
 	window int
 	stride int
+
+	// gated is set by WithMinConfidence or WithMinConfidenceMap; minConfidence is then a float64
+	// or a pyjson.Object, checked by checkMinConfidence.
+	gated         bool
+	minConfidence any
+
+	hooks       []Hook // WithHooks, then the callables, in Python's order
+	starts      []Hook // WithOnPredictStart callables
+	ends        []Hook // WithOnPredictEnd callables
+	skipDefault bool   // WithoutDefaultHooks
+	hooked      bool   // a hook option was given; PredictLong refuses it
+
+	// maxLen and headMaxLen override the checkpoint's budgets when above 0; a start hook sets them.
+	maxLen, headMaxLen int
 }
 
 // WithLanguage names the request's language as a BCP 47 tag. Its primary subtag selects a
@@ -211,7 +239,12 @@ func (a *Agent) Predict(ctx context.Context, state any, qs schema.Questions, opt
 // list or dict. With no questions each state gets an empty answer and zero usage, with no model
 // run.
 //
+// WithMinConfidence or WithMinConfidenceMap gates every answer: it sets low_confidence,
+// abstention and abstention_threshold as laya does. An invalid threshold is refused first, as a
+// *MinConfidenceError, before any state is encoded or run.
+//
 // Errors may be wrapped; match them with errors.Is and errors.As:
+//   - *MinConfidenceError, for an invalid threshold, before anything else is checked;
 //   - ErrClosed, once Close has been called (a context already done is reported first);
 //   - ctx.Err(), checked on entry, before each state is encoded and between runs;
 //   - *StateError, naming the state, around sequence.ErrUnsupportedState (also for a nil
@@ -225,6 +258,17 @@ func (a *Agent) PredictBatch(ctx context.Context, states []any, qs schema.Questi
 			opt(&c)
 		}
 	}
+	if err := checkHooks(c.hooks); err != nil {
+		return nil, err
+	}
+	// Validated up front, as laya does, so a bad threshold fails before any work.
+	var g *gate
+	if c.gated {
+		var err error
+		if g, err = checkMinConfidence(c.minConfidence); err != nil {
+			return nil, err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -232,7 +276,17 @@ func (a *Agent) PredictBatch(ctx context.Context, states []any, qs schema.Questi
 		return nil, err
 	}
 	defer a.leave()
-	return a.predictStates(ctx, states, qs, c)
+	if hooks := a.composeHooks(c); len(hooks) > 0 {
+		return a.predictHooked(ctx, states, qs, c, g, hooks)
+	}
+	preds, err := a.inferStates(ctx, states, qs, c)
+	if err != nil {
+		return nil, err
+	}
+	if g != nil {
+		g.apply(preds)
+	}
+	return preds, nil
 }
 
 // predictStates is PredictBatch past the entry checks, for a caller that has already entered.
